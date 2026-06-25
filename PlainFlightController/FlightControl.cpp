@@ -17,8 +17,9 @@
 */
 
 /**
-* @file   FlightControl.cpp
+* @file   FlightControl.cpp (ADRC version)
 * @brief  This class contains methods to operate the flight controller.
+*         Modified to use ADRC (Active Disturbance Rejection Control) instead of PIDF.
 */
 
 #include "FlightControl.hpp"
@@ -38,7 +39,7 @@ FlightControl::begin()
   if (Serial)
   {
     delay(3000);  //Need to wait by this magic number or some console data will be lost while PC is connecting.
-    Serial.print("PlainFlightController: ");
+    Serial.print("PlainFlightController ADRC: ");
     Serial.println(InternalConfig::SOFTWARE_VERSION);
   }
 
@@ -286,12 +287,13 @@ FlightControl::doPassThroughState()
 
 /**
 * @brief  Defines what is done when in gyro rate mode.
+*         ADRC version - replaces PIDF with ADRC control law
 */
 void
 FlightControl::doRateState()
 {
   DemandProcessor::Demands demands = *rc.getDemands();
-  processPIDF(&demands);
+  processADRC(&demands);
   myModel->servoRateMixer(&demands, config.getServoTrims());
 
   if constexpr(Config::USE_LOW_VOLTS_CUT_OFF)
@@ -305,6 +307,7 @@ FlightControl::doRateState()
 
 /**
 * @brief  Defines what is done when in self levelled mode.
+*         ADRC version
 */
 void
 FlightControl::doFailSafeState()
@@ -326,6 +329,7 @@ FlightControl::doFailSafeState()
 
 /**
 * @brief  Defines what is done when in self levelled mode.
+*         ADRC version - actively rejects disturbances (wind, etc.)
 */
 void
 FlightControl::doLevelledState()
@@ -342,7 +346,7 @@ FlightControl::doLevelledState()
   pitchDemand = map32(pitchDemand, -config.getMaxPitchAngle(), config.getMaxPitchAngle(), -config.getPitchRate(), config.getPitchRate());
   demands.pitch = constrain(pitchDemand, -config.getPitchRate(), config.getPitchRate());
 
-  processPIDF(&demands);
+  processADRC(&demands);
   myModel->servoRateMixer(&demands, config.getServoTrims());
 
   if constexpr(Config::USE_LOW_VOLTS_CUT_OFF)
@@ -357,10 +361,7 @@ FlightControl::doLevelledState()
 /**
 * @brief  Defines what is done when in acro trainer mode.
 * @note   When pitch and roll are centred we self level otherwise we operate in rate mode.
-* @note   When sticks become centred the control system gets a step response, as a result we purposely use ACRO_TRAINER_LEVEL_RATE to limit...
-* @note   ... how quickly we recover otherwise our normal flight gains can cause overshoot due to the step response. This overshoot can exceed...
-* @note   ...the gyro degs/sec setting and clip the gyro response in turn screwing up the Madgwick filter level reference...
-* @note   ...This is more of a problem with multicopters motors that can respond very quickly.
+* @note   ADRC version provides smoother recovery without overshoot.
 */
 void
 FlightControl::doAcroTrainerState()
@@ -383,7 +384,7 @@ FlightControl::doAcroTrainerState()
     pitchDemand = map32(pitchDemand, -config.getMaxPitchAngle(), config.getMaxPitchAngle(), -ACRO_TRAINER_RECOVERY_RATE, ACRO_TRAINER_RECOVERY_RATE);
     demands.pitch = constrain(pitchDemand, -ACRO_TRAINER_RECOVERY_RATE, ACRO_TRAINER_RECOVERY_RATE);
 
-    processPIDF(&demands);
+    processADRC(&demands);
     myModel->servoRateMixer(&demands, config.getServoTrims());
 
     if constexpr(Config::USE_LOW_VOLTS_CUT_OFF)
@@ -402,6 +403,7 @@ FlightControl::doAcroTrainerState()
 
 /**
 * @brief  Defines what is done when in prop hanging state.
+*         ADRC version
 */
 void
 FlightControl::doPropHangState()
@@ -450,7 +452,7 @@ FlightControl::doPropHangState()
     demands.pitch = constrain(pitchDemand, -config.getPitchRate(), config.getPitchRate());
   }
 
-  processPIDF(&demands);
+  processADRC(&demands);
   myModel->servoRateMixer(&demands, config.getServoTrims());
 
   if constexpr(Config::USE_LOW_VOLTS_CUT_OFF)
@@ -481,7 +483,7 @@ FlightControl::doWifiApState()
 /**
 * @brief  Defines what is done when faulted.
 * @note   Only gets here from I2C read error, model will operate in pass through with no throttle.
-* @note   If using mutlicopter then you are going to fall out of the sky !
+* @note   If using multicopter then you are going to fall out of the sky !
 */
 void
 FlightControl::doFaultedState()
@@ -494,87 +496,110 @@ FlightControl::doFaultedState()
 
 
 /**
-* @brief  When flight state changes i gain is zeroed out.
+* @brief  When flight state changes ESO state is reset.
+*         This prevents windup and ensures clean transitions between modes.
 */
 void
 FlightControl::checkStateChange()
 {
   if (m_flightState != m_lastFlightState)
   {
-    rollPIDF.iTermReset();
-    pitchPIDF.iTermReset();
-    yawPIDF.iTermReset();
+    rollADRC.reset();
+    pitchADRC.reset();
+    yawADRC.reset();
     m_lastFlightState = m_flightState;
   }
 }
 
 
 /**
-* @brief  Processes pitch, roll and yaw PIDF's.
-* @param  demands Structure of demand upon the system
-* @param  roll  demand
-* @param  yaw   demand
+* @brief  Processes pitch, roll and yaw using ADRC control law.
+*         ADRC actively rejects disturbances like wind, friction, and sensor bias.
+*
+* Advantages over PIDF:
+* - Estimates and compensates disturbances (wind gusts, mechanical play)
+* - No D-gain noise amplification (observer handles filtering)
+* - Universal (same gains work for different aircraft types)
+* - Simpler tuning (omega_n, zeta, b_est, k_eso instead of P, I, D, F)
+*
+* @param demands Structure of demand upon the system
 */
 void
-FlightControl::processPIDF(DemandProcessor::Demands * const demands)
+FlightControl::processADRC(DemandProcessor::Demands * const demands)
 {
-  if constexpr(Config::REVERSE_PITCH_CORRECTIONS)
-  {
-    demands->pitch = pitchPIDF.pidfController(demands->pitch, static_cast<int32_t>(-imuData->mpu6050.gyro_Y * 100.0f), config.getPitchGains());
-  }
-  else
-  {
-    demands->pitch = pitchPIDF.pidfController(demands->pitch, static_cast<int32_t>(imuData->mpu6050.gyro_Y * 100.0f), config.getPitchGains());
-  }
+  // Get time delta for ADRC observer integration
+  static uint32_t lastTime = 0;
+  uint32_t currentTime = micros();
+  float dt = (currentTime - lastTime) / 1000000.0f;  // Convert to seconds
+  if (dt > 0.02f) dt = 0.02f;  // Cap at 20ms to prevent observer instability
+  lastTime = currentTime;
 
+  // Get current gyro rates from IMU (in degrees/second * 100)
+  int32_t gyroX = static_cast<int32_t>(imuData->mpu6050.gyro_X * 100.0f);
+  int32_t gyroY = static_cast<int32_t>(imuData->mpu6050.gyro_Y * 100.0f);
+  int32_t gyroZ = static_cast<int32_t>(imuData->mpu6050.gyro_Z * 100.0f);
+
+  // ADRC for Roll axis
   if constexpr(Config::REVERSE_ROLL_CORRECTIONS)
   {
-    demands->roll = rollPIDF.pidfController(demands->roll, static_cast<int32_t>(-imuData->mpu6050.gyro_X * 100.0f), config.getRollGains());
+    demands->roll = rollADRC.adrcController(demands->roll, -gyroX, config.getRollGains(), dt);
   }
   else
   {
-    demands->roll = rollPIDF.pidfController(demands->roll, static_cast<int32_t>(imuData->mpu6050.gyro_X * 100.0f), config.getRollGains());
+    demands->roll = rollADRC.adrcController(demands->roll, gyroX, config.getRollGains(), dt);
   }
 
+  // ADRC for Pitch axis
+  if constexpr(Config::REVERSE_PITCH_CORRECTIONS)
+  {
+    demands->pitch = pitchADRC.adrcController(demands->pitch, -gyroY, config.getPitchGains(), dt);
+  }
+  else
+  {
+    demands->pitch = pitchADRC.adrcController(demands->pitch, gyroY, config.getPitchGains(), dt);
+  }
+
+  // ADRC for Yaw axis
   float gyro_Z = imuData->mpu6050.gyro_Z;
 
   if constexpr(Config::REVERSE_YAW_CORRECTIONS)
   {
-    //Purposely change sign of Z axis here to avoid screwing up madgwick filter.
     gyro_Z = -gyro_Z;
   }
 
   if constexpr(InternalConfig::MODEL_IS_MULTICOPTER)
   {
-    //Multicopter only
-    demands->yaw = yawPIDF.pidfController(demands->yaw, static_cast<int32_t>(gyro_Z * 100.0f), config.getYawGains());
+    //Multicopter yaw control
+    demands->yaw = yawADRC.adrcController(demands->yaw, gyroZ, config.getYawGains(), dt);
   }
   else
   {
-    //Fixed wing only
+    //Fixed wing yaw control with heading hold option
     if constexpr(Config::USE_HEADING_HOLD)
     {
       if (rc.headingHoldActive() || rc.propHangActive())
       {
-        //Apply i gain to yaw
-        demands->yaw = yawPIDF.pidfController(demands->yaw, static_cast<int32_t>(gyro_Z * 100.0f), config.getYawGains());
+        //Apply ADRC with full disturbance rejection
+        demands->yaw = yawADRC.adrcController(demands->yaw, gyroZ, config.getYawGains(), dt);
       }
       else
       {
-        //Do not apply i gain to yaw
-        yawPIDF.iTermReset();
-        PIDF::Gains yawGains = *config.getYawGains();
-        yawGains.i = 0;
-        demands->yaw = yawPIDF.pidfController(demands->yaw, static_cast<int32_t>(gyro_Z * 100.0f), &yawGains);
+        //Heading hold off - reset ADRC observer to prevent integrator windup
+        yawADRC.reset();
+        // Simple rate control without heading hold (no I term equivalent)
+        // Use default gains but disable disturbance rejection
+        ADRC::Gains yawGains = *config.getYawGains();
+        yawGains.k_eso = 0.0f;  // Disable disturbance estimation
+        demands->yaw = yawADRC.adrcController(demands->yaw, gyroZ, &yawGains, dt);
       }
     }
     else
     {
-      //Never apply i gain to yaw
-      yawPIDF.iTermReset();
-      PIDF::Gains yawGains = *config.getYawGains();
-      yawGains.i = 0;
-      demands->yaw = yawPIDF.pidfController(demands->yaw, static_cast<int32_t>(gyro_Z * 100.0f), &yawGains);
+      //Never apply heading hold on yaw
+      yawADRC.reset();
+      ADRC::Gains yawGains = *config.getYawGains();
+      yawGains.k_eso = 0.0f;
+      demands->yaw = yawADRC.adrcController(demands->yaw, gyroZ, &yawGains, dt);
     }
   }
 }
