@@ -19,6 +19,7 @@
 /**
 * @file   FlightControl.hpp
 * @brief  This class contains methods to operate the flight controller.
+*         Uses ADRC (Active Disturbance Rejection Control) for stabilization.
 */
 #pragma once
 
@@ -28,7 +29,7 @@
 #include "DemandProcessor.hpp"
 #include "BatteryMonitor.hpp"
 #include "LED.hpp"
-#include "PIDF.hpp"
+#include "ADRC.hpp"
 #include "IMU.hpp"
 #include "Config.hpp"
 #include "RxBase.hpp"
@@ -71,7 +72,7 @@ class FlightControl : public Utilities
     void doPropHangState();
     void doAcroTrainerState();
     void checkStateChange();
-    void processPIDF(DemandProcessor::Demands * const demands);
+    void processADRC(DemandProcessor::Demands * const demands);
 
     //Objects
     Led statusLed = Led(Config::ESP32S3.LED_ON_BOARD, Config::ESP32S3.SINK_ONBOARD_LED);
@@ -81,9 +82,9 @@ class FlightControl : public Utilities
 
     DemandProcessor rc = DemandProcessor();
     BatteryMonitor batteryMonitor = BatteryMonitor(Config::ESP32S3.BATTERY_ADC);
-    PIDF pitchPIDF = PIDF();
-    PIDF yawPIDF = PIDF();
-    PIDF rollPIDF = PIDF();
+    ADRC pitchADRC = ADRC();
+    ADRC yawADRC = ADRC();
+    ADRC rollADRC = ADRC();
     IMU imu = IMU();  
     Configurator config;  
 };
